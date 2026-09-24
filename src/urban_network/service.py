@@ -1,7 +1,8 @@
 """协调管网监测、告警、工单和应急资源分配的应用服务。"""
 from __future__ import annotations
-import hashlib,uuid
+import sqlite3,uuid
 from .auth import Auth
+from .errors import Conflict
 from .models import Reading,Segment,as_dict,utcnow
 from .risk import leak_probability,score_reading
 from .storage import audit,connect,rows,transaction
@@ -23,16 +24,36 @@ class NetworkService:
     def ingest_reading(self,token,reading):
         actor=self.auth.require(token,"measure"); reading.validate(); seg=self.db.execute("SELECT criticality FROM segments WHERE segment_id=?",(reading.segment_id,)).fetchone()
         if not seg:raise KeyError(reading.segment_id)
-        risk=score_reading(reading.pressure_kpa,reading.flow_lps,reading.acoustic_db,seg[0]); fingerprint=hashlib.sha256(f"{reading.segment_id}|{reading.sensor_id}|{reading.observed_at}".encode()).hexdigest()
-        with transaction(self.db):
-            if self.db.execute("SELECT reading_id FROM readings WHERE reading_id=?",(reading.reading_id,)).fetchone(): return {"reading_id":reading.reading_id,"duplicate":True,"risk":as_dict(risk)}
-            self.db.execute("INSERT INTO readings VALUES(?,?,?,?,?,?,?)",(reading.reading_id,reading.segment_id,reading.sensor_id,reading.pressure_kpa,reading.flow_lps,reading.acoustic_db,reading.observed_at)); alert_id=None
-            if risk.severity in {"high","critical"}:
-                alert_id="alert-"+fingerprint[:18]; self.db.execute("INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?,?)",(alert_id,reading.segment_id,fingerprint,risk.severity,risk.score,"open",utcnow(),None))
-            audit(self.db,"reading",reading.reading_id,"ingested",actor.user_id,{"risk":as_dict(risk),"alert_id":alert_id})
-        return {"reading_id":reading.reading_id,"duplicate":False,"risk":as_dict(risk),"alert_id":alert_id}
+        fingerprint=reading.business_fingerprint(); observed_at=reading.normalized_observed_at()
+        try:
+            with transaction(self.db):
+                # BEGIN IMMEDIATE 串行化首写：并发重试只会有一个写入者，后到者在锁释放后看到已提交记录。
+                existing=self.db.execute("SELECT * FROM readings WHERE reading_id=?",(reading.reading_id,)).fetchone()
+                if existing:
+                    if existing["payload_fingerprint"]==fingerprint:
+                        return self._reading_result(existing,seg[0],duplicate=True)
+                    raise Conflict(f"reading_id {reading.reading_id} 已对应不同读数载荷（压力、流量、声学值或采集时刻不一致），编号可能被网关复用")
+                owner=self.db.execute("SELECT reading_id FROM readings WHERE segment_id=? AND sensor_id=? AND observed_at=?",(reading.segment_id,reading.sensor_id,observed_at)).fetchone()
+                if owner:
+                    raise Conflict(f"管段 {reading.segment_id} 传感器 {reading.sensor_id} 在 {observed_at} 的读数已由编号 {owner[0]} 占用，当前编号 {reading.reading_id} 与之冲突")
+                self.db.execute("INSERT INTO readings VALUES(?,?,?,?,?,?,?,?)",(reading.reading_id,reading.segment_id,reading.sensor_id,reading.pressure_kpa,reading.flow_lps,reading.acoustic_db,observed_at,fingerprint))
+                risk=score_reading(reading.pressure_kpa,reading.flow_lps,reading.acoustic_db,seg[0]); alert_id=None
+                if risk.severity in {"high","critical"}:
+                    alert_id="alert-"+fingerprint[:18]; self.db.execute("INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?,?,?)",(alert_id,reading.segment_id,fingerprint,risk.severity,risk.score,"open",utcnow(),None))
+                audit(self.db,"reading",reading.reading_id,"ingested",actor.user_id,{"fingerprint":fingerprint,"risk":as_dict(risk),"alert_id":alert_id})
+        except sqlite3.IntegrityError as exc:
+            # 唯一约束兜底（例如极端并发下的业务键竞争）：统一报冲突，绝不写入半成品。
+            raise Conflict(f"读数 {reading.reading_id} 与既有记录冲突") from exc
+        return {"reading_id":reading.reading_id,"duplicate":False,"risk":as_dict(risk),"alert_id":alert_id,"fingerprint":fingerprint}
+    def _reading_result(self,row,criticality,duplicate):
+        """按已存储记录重建响应：重放返回的始终是第一次写入的原始结果。"""
+        risk=score_reading(row["pressure_kpa"],row["flow_lps"],row["acoustic_db"],criticality)
+        alert=self.db.execute("SELECT alert_id FROM alerts WHERE fingerprint=?",(row["payload_fingerprint"],)).fetchone()
+        return {"reading_id":row["reading_id"],"duplicate":duplicate,"risk":as_dict(risk),"alert_id":alert[0] if alert else None,"fingerprint":row["payload_fingerprint"]}
     def risk_report(self,token,segment_id):
-        self.auth.require(token,"analyze"); readings=rows(self.db,"SELECT * FROM readings WHERE segment_id=? ORDER BY observed_at",(segment_id,)); alerts=rows(self.db,"SELECT * FROM alerts WHERE segment_id=? ORDER BY created_at",(segment_id,)); return {"segment_id":segment_id,"readings":len(readings),"alerts":alerts,"leak_probability":leak_probability(alerts)}
+        self.auth.require(token,"analyze"); readings=rows(self.db,"SELECT * FROM readings WHERE segment_id=? ORDER BY observed_at",(segment_id,))
+        alerts=rows(self.db,"SELECT a.*,r.reading_id AS source_reading_id FROM alerts a LEFT JOIN readings r ON r.segment_id=a.segment_id AND r.payload_fingerprint=a.fingerprint WHERE a.segment_id=? ORDER BY a.created_at",(segment_id,))
+        return {"segment_id":segment_id,"readings":len(readings),"alerts":alerts,"leak_probability":leak_probability(alerts)}
     def create_work_order(self,token,segment_id,alert_id,assignee,priority=3):
         actor=self.auth.require(token,"work_order")
         if not assignee.strip() or not 1<=priority<=5:raise ValueError("assignee and priority are invalid")

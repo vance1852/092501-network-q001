@@ -1,8 +1,9 @@
 """依赖标准库的 JSON HTTP API。"""
 from __future__ import annotations
 import argparse,json
-from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler,HTTPServer
 from .models import Reading,Segment
+from .errors import Conflict
 from .service import NetworkService
 class Handler(BaseHTTPRequestHandler):
     service=NetworkService()
@@ -29,7 +30,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(201,self.service.create_work_order(token,self.path.split("/")[2],body["alert_id"],body["assignee"],body.get("priority",3)))
             return self._send(404,{"error":"not found"})
         except PermissionError as e:return self._send(403,{"error":str(e)})
+        except Conflict as e:return self._send(409,{"error":"conflict","message":str(e)})
         except Exception as e:return self._send(400,{"error":str(e)})
 def main():
-    p=argparse.ArgumentParser(); p.add_argument("--database",default=":memory:"); p.add_argument("--host",default="127.0.0.1"); p.add_argument("--port",type=int,default=8080); a=p.parse_args(); Handler.service=NetworkService(a.database); Handler.service.bootstrap(); ThreadingHTTPServer((a.host,a.port),Handler).serve_forever()
+    p=argparse.ArgumentParser(); p.add_argument("--database",default=":memory:"); p.add_argument("--host",default="127.0.0.1"); p.add_argument("--port",type=int,default=8080); a=p.parse_args(); Handler.service=NetworkService(a.database); Handler.service.bootstrap()
+    # 单连接服务使用 HTTPServer 串行处理请求，避免跨线程共用同一 SQLite 连接；
+    # 多实例/多连接并发首写由存储层 BEGIN IMMEDIATE 与唯一约束保证。
+    HTTPServer((a.host,a.port),Handler).serve_forever()
 if __name__=="__main__":main()
