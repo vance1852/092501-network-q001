@@ -41,4 +41,4 @@ PYTHONPATH=src python3 -m urban_network.acceptance --workspace .
 PYTHONPATH=src python3 -m urban_network.api --database network.sqlite3 --host 127.0.0.1 --port 8080
 ```
 
-`GET /health` 返回服务状态，其余接口使用 JSON 和 `Authorization: Bearer <token>` 会话，支持管段登记、读数上报、风险查询、工单创建和应急资源分配。
+`GET /health` 返回服务状态，其余接口使用 JSON 和 `Authorization: Bearer <token>` 会话，支持管段登记、读数上报、风险查询、工单创建和应急资源分配。读数上报按业务指纹（管段、传感器、采集时刻和测量值）幂等：完全相同的重试返回原记录，同一编号载荷不同或传感器时刻被其他编号占用时返回 409 冲突，且不会产生额外的告警或审计事件。

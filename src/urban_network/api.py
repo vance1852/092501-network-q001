@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse,json
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+from .errors import ServiceError
 from .models import Reading,Segment
 from .service import NetworkService
 class Handler(BaseHTTPRequestHandler):
@@ -16,6 +17,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path.startswith("/segments/"):return self._send(200,self.service.segment(self._token(),self.path.split("/",2)[2]))
             return self._send(404,{"error":"not found"})
         except PermissionError as e:return self._send(403,{"error":str(e)})
+        except ServiceError as e:return self._send(e.status,{"error":str(e)})
         except Exception as e:return self._send(400,{"error":str(e)})
     def do_POST(self):
         try:
@@ -29,6 +31,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(201,self.service.create_work_order(token,self.path.split("/")[2],body["alert_id"],body["assignee"],body.get("priority",3)))
             return self._send(404,{"error":"not found"})
         except PermissionError as e:return self._send(403,{"error":str(e)})
+        except ServiceError as e:return self._send(e.status,{"error":str(e)})
         except Exception as e:return self._send(400,{"error":str(e)})
 def main():
     p=argparse.ArgumentParser(); p.add_argument("--database",default=":memory:"); p.add_argument("--host",default="127.0.0.1"); p.add_argument("--port",type=int,default=8080); a=p.parse_args(); Handler.service=NetworkService(a.database); Handler.service.bootstrap(); ThreadingHTTPServer((a.host,a.port),Handler).serve_forever()
